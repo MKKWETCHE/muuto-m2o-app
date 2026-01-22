@@ -25,20 +25,34 @@ def normalize_key(val: str) -> str:
         .replace(")", "")
     )
 
-def load_template_columns(template_path: str) -> list:
-    """Load column headers from template (prices will be ignored later)."""
+def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Pick the first matching column from candidates."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # Try case-insensitive match
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
+    for c in candidates:
+        key = str(c).strip().lower()
+        if key in lower_map:
+            return lower_map[key]
+    return None
+
+def load_template_columns(template_path: str) -> list[str]:
+    """Load columns from template header (row 1)."""
     if not os.path.exists(template_path):
         return []
     try:
-        df = pd.read_excel(template_path, nrows=0)
+        df = pd.read_excel(template_path, nrows=0, engine="openpyxl")
         return list(df.columns)
     except Exception:
         return []
 
-def remove_price_columns(cols: list) -> list:
+def remove_price_columns(cols: list[str]) -> list[str]:
+    """Drop any wholesale/retail price columns (incl variants)."""
     out = []
     for c in cols:
-        lc = str(c).lower()
+        lc = str(c).strip().lower()
         if lc.startswith("wholesale price") or lc.startswith("retail price"):
             continue
         out.append(c)
@@ -50,112 +64,150 @@ def build_excel(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Masterdata")
     return buffer.getvalue()
 
+def safe_series_str(s: pd.Series) -> pd.Series:
+    return s.astype(str).fillna("")
+
 # --------------------------------------------------
 # Streamlit setup
 # --------------------------------------------------
-st.set_page_config(
-    page_title="Muuto Made-to-Order Master Data Tool",
-    layout="wide",
-)
-
-# --------------------------------------------------
-# Session state
-# --------------------------------------------------
-for key, default in {
-    "raw_df": None,
-    "filtered_raw_df": pd.DataFrame(),
-    "selected_family": DEFAULT_NO_SELECTION,
-    "selected_items": {},
-    "final_items": [],
-    "template_cols": [],
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+st.set_page_config(page_title="Muuto Made-to-Order Master Data Tool", layout="wide")
 
 # --------------------------------------------------
 # Header
 # --------------------------------------------------
-cols = st.columns([6, 1])
-with cols[0]:
+top = st.columns([6, 1])
+with top[0]:
     st.title("Muuto Made-to-Order Master Data Tool")
-with cols[1]:
+with top[1]:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, use_container_width=True)
 
 st.markdown(
     """
-    This tool allows you to select Made-to-Order products and generate master data.
+This tool allows you to select Made-to-Order products and generate master data.
 
-    **Pricing and currency selection have been removed.**
-    The tool is kept minimal until BC goes live.
-    """
+**Pricing and currency selection have been removed.**  
+The tool is kept minimal until BC goes live.
+"""
 )
-
 st.markdown("---")
 
 # --------------------------------------------------
 # Load data
 # --------------------------------------------------
 if not os.path.exists(RAW_DATA_XLSX_PATH):
-    st.error("raw-data.xlsx not found.")
+    st.error(f"Missing file: {RAW_DATA_XLSX_PATH}")
     st.stop()
 
-st.session_state.raw_df = pd.read_excel(RAW_DATA_XLSX_PATH)
-st.session_state.filtered_raw_df = st.session_state.raw_df.copy()
+try:
+    raw_df = pd.read_excel(RAW_DATA_XLSX_PATH, engine="openpyxl")
+except Exception as e:
+    st.error(f"Could not read raw-data.xlsx: {e}")
+    st.stop()
 
-st.session_state.template_cols = remove_price_columns(
-    load_template_columns(TEMPLATE_XLSX_PATH)
-)
+# No currency filtering anymore – use all data
+df = raw_df.copy()
+
+# Load template columns (optional)
+template_cols = remove_price_columns(load_template_columns(TEMPLATE_XLSX_PATH))
 
 # --------------------------------------------------
-# STEP 1 – Product selection (was Step 2)
+# Column mapping (aliases)
+# --------------------------------------------------
+family_col = pick_col(df, ["Product Family", "Family", "Product_Family"])
+product_col = pick_col(df, ["Product Display Name", "Item Name", "Product", "Item", "Product Name"])
+uph_type_col = pick_col(df, ["Upholstery Type", "Upholstery", "Upholstery Type Cleaned", "Upholstery_Type"])
+uph_color_col = pick_col(df, ["Upholstery Color", "Upholstery Colour", "Upholstery Color No", "Upholstery Color Number", "Upholstery_Color"])
+item_no_col = pick_col(df, ["Item No", "Item No.", "Item Number", "Item_No", "ItemNo"])
+article_no_col = pick_col(df, ["Article No", "Article No.", "Article Number", "Article_No", "ArticleNo"])
+
+missing = []
+if not family_col: missing.append("Product Family")
+if not product_col: missing.append("Product Display Name / Item Name")
+if not uph_type_col: missing.append("Upholstery Type")
+if not uph_color_col: missing.append("Upholstery Color")
+
+if missing:
+    st.error("Required columns missing in raw-data.xlsx: " + ", ".join(missing))
+    st.write("Columns found in raw-data.xlsx:")
+    st.write(list(df.columns))
+    st.stop()
+
+# Normalize to strings for filtering/comparison safety
+df[family_col] = safe_series_str(df[family_col])
+df[product_col] = safe_series_str(df[product_col])
+df[uph_type_col] = safe_series_str(df[uph_type_col])
+df[uph_color_col] = safe_series_str(df[uph_color_col])
+
+# --------------------------------------------------
+# SESSION STATE
+# --------------------------------------------------
+if "selected_family" not in st.session_state:
+    st.session_state.selected_family = DEFAULT_NO_SELECTION
+
+if "selected_keys" not in st.session_state:
+    st.session_state.selected_keys = set()
+
+# --------------------------------------------------
+# STEP 1 – Product selection (currency removed)
 # --------------------------------------------------
 st.header("Step 1: Select Product Combinations")
 
-df = st.session_state.filtered_raw_df
+families = [DEFAULT_NO_SELECTION] + sorted([f for f in df[family_col].dropna().unique() if str(f).strip()])
+if st.session_state.selected_family not in families:
+    st.session_state.selected_family = DEFAULT_NO_SELECTION
 
-if "Product Family" not in df.columns:
-    st.error("Column 'Product Family' missing in raw data.")
-    st.stop()
-
-families = [DEFAULT_NO_SELECTION] + sorted(df["Product Family"].dropna().unique())
-st.session_state.selected_family = st.selectbox(
+selected_family = st.selectbox(
     "Select Product Family",
     families,
-    index=families.index(st.session_state.selected_family)
-    if st.session_state.selected_family in families
-    else 0,
+    index=families.index(st.session_state.selected_family),
 )
+st.session_state.selected_family = selected_family
 
-if st.session_state.selected_family == DEFAULT_NO_SELECTION:
+if selected_family == DEFAULT_NO_SELECTION:
     st.info("Select a product family to continue.")
     st.stop()
 
-family_df = df[df["Product Family"] == st.session_state.selected_family]
+family_df = df[df[family_col].astype(str) == str(selected_family)].copy()
 
-if not {"Product Display Name", "Upholstery Type", "Upholstery Color"}.issubset(family_df.columns):
-    st.error("Required columns missing in raw data.")
+products = sorted([p for p in family_df[product_col].dropna().unique() if str(p).strip()])
+uph_types = sorted([u for u in family_df[uph_type_col].dropna().unique() if str(u).strip()])
+
+if not products or not uph_types:
+    st.warning("No products or upholstery types found for this family.")
     st.stop()
 
-products = sorted(family_df["Product Display Name"].unique())
-upholstery_types = sorted(family_df["Upholstery Type"].unique())
-
+# Build selection UI
 st.markdown("### Select items")
+st.caption("Expand a product and tick the upholstery color combinations you want.")
 
-for product in products:
-    with st.expander(product):
-        for uph_type in upholstery_types:
-            colors = family_df[
-                (family_df["Product Display Name"] == product)
-                & (family_df["Upholstery Type"] == uph_type)
-            ]["Upholstery Color"].unique()
+for prod in products:
+    with st.expander(prod):
+        prod_df = family_df[family_df[product_col].astype(str) == str(prod)]
+        for ut in uph_types:
+            ut_df = prod_df[prod_df[uph_type_col].astype(str) == str(ut)]
+            if ut_df.empty:
+                continue
+            colors = sorted([c for c in ut_df[uph_color_col].dropna().unique() if str(c).strip()])
 
-            for color in colors:
-                key = normalize_key(f"{product}_{uph_type}_{color}")
-                st.checkbox(
-                    f"{uph_type} – {color}",
-                    key=key,
+            if not colors:
+                continue
+
+            st.markdown(f"**{ut}**")
+            for col in colors:
+                key = normalize_key(f"{selected_family}__{prod}__{ut}__{col}")
+                checked = key in st.session_state.selected_keys
+
+                new_val = st.checkbox(
+                    f"{col}",
+                    value=checked,
+                    key=f"cb_{key}",
                 )
+
+                if new_val:
+                    st.session_state.selected_keys.add(key)
+                else:
+                    st.session_state.selected_keys.discard(key)
 
 # --------------------------------------------------
 # STEP 2 – Review selections
@@ -163,30 +215,41 @@ for product in products:
 st.markdown("---")
 st.header("Step 2: Review Selections")
 
-selected = [
-    key for key, val in st.session_state.items()
-    if key not in ["raw_df", "filtered_raw_df", "selected_family", "template_cols"]
-    and val is True
-]
+selected_items = []
+for k in sorted(st.session_state.selected_keys):
+    parts = k.split("__")
+    if len(parts) != 4:
+        continue
+    fam, prod, ut, col = parts
 
-if not selected:
+    m = family_df[
+        (family_df[product_col].astype(str) == str(prod))
+        & (family_df[uph_type_col].astype(str) == str(ut))
+        & (family_df[uph_color_col].astype(str) == str(col))
+    ]
+
+    if m.empty:
+        continue
+
+    row = m.iloc[0]
+
+    item_no = row.get(item_no_col) if item_no_col else None
+    article_no = row.get(article_no_col) if article_no_col else None
+
+    selected_items.append(row)
+
+    st.write(
+        f"• {prod} / {ut} / {col}"
+        + (f" (Item: {item_no})" if item_no is not None and str(item_no).strip() else "")
+        + (f" (Article: {article_no})" if article_no is not None and str(article_no).strip() else "")
+    )
+
+if not selected_items:
     st.info("No items selected yet.")
-else:
-    st.session_state.final_items = []
-    for key in selected:
-        parts = key.split("_")
-        product, uph_type, color = parts[0], parts[1], parts[2]
-
-        match = family_df[
-            (family_df["Product Display Name"] == product)
-            & (family_df["Upholstery Type"] == uph_type)
-            & (family_df["Upholstery Color"] == color)
-        ]
-
-        if not match.empty:
-            row = match.iloc[0]
-            st.write(f"• {product} / {uph_type} / {color} (Item {row['Item No']})")
-            st.session_state.final_items.append(row)
+    st.markdown("---")
+    st.header("Step 3: Generate Master Data File")
+    st.button("Generate Master Data File", disabled=True)
+    st.stop()
 
 # --------------------------------------------------
 # STEP 3 – Download
@@ -194,21 +257,23 @@ else:
 st.markdown("---")
 st.header("Step 3: Generate Master Data File")
 
-if st.session_state.final_items:
-    output_df = pd.DataFrame(st.session_state.final_items)
+output_df = pd.DataFrame(selected_items)
 
-    if st.session_state.template_cols:
-        output_df = output_df[
-            [c for c in st.session_state.template_cols if c in output_df.columns]
-        ]
+# Apply template ordering (optional)
+if template_cols:
+    # Keep only template columns that exist in output_df
+    cols_in_df = [c for c in template_cols if c in output_df.columns]
+    if cols_in_df:
+        output_df = output_df[cols_in_df]
 
-    excel_bytes = build_excel(output_df)
+# Ensure price columns are not present even if they existed in raw/template
+output_df = output_df[[c for c in output_df.columns if not str(c).lower().startswith(("wholesale price", "retail price"))]]
 
-    st.download_button(
-        "Generate and Download Master Data File",
-        excel_bytes,
-        file_name="masterdata_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-else:
-    st.button("Generate Master Data File", disabled=True)
+excel_bytes = build_excel(output_df)
+
+st.download_button(
+    "Generate and Download Master Data File",
+    data=excel_bytes,
+    file_name="masterdata_output.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
